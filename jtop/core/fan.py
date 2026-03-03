@@ -602,6 +602,10 @@ class FanService(object):
         if index >= len(self._fan_list[name]['pwm']):
             logger.error("Wrong index {index} for {name}".format(index=index, name=name))
             return
+
+        if self._nvfancontrol and nvfancontrol_is_active():
+            os.system('systemctl stop nvfancontrol')
+            
         # Update configuration on board
         fan_config = self._config.get('fan', {})
         # Set new profile
