@@ -22,6 +22,7 @@ import json
 # from warnings import warn
 from datetime import datetime, timedelta
 from multiprocessing import Event, AuthenticationError
+from multiprocessing.managers import BaseProxy
 from threading import Thread
 from .service import JtopManager
 from .core.hardware import get_platform_variables
@@ -48,6 +49,9 @@ if sys.version_info[0] == 2:
 logger = logging.getLogger(__name__)
 # Gain timeout lost connection
 TIMEOUT_GAIN = 3
+# Smallest supported refresh interval (seconds). Below this the service cannot
+# finish a stats read per tick and jetson.ok() keeps returning False (#414, #482)
+MIN_INTERVAL = 0.5
 # Version match
 VERSION_RE = re.compile(r""".*__version__ = ["'](.*?)['"]""", re.S)
 
@@ -88,6 +92,10 @@ class jtop(Thread):
         self._running = False
         # Load interval
         self._interval = float(interval)
+        if self._interval < MIN_INTERVAL:
+            logger.warning("interval {interval}s is below the minimum, using {min}s".format(
+                interval=self._interval, min=MIN_INTERVAL))
+            self._interval = MIN_INTERVAL
         # Initialize observer
         self._observers = set()
         # Stats read from service
@@ -642,10 +650,11 @@ class jtop(Thread):
         ========== =================== ====================================================
         tot        :py:class:`int`     Total RAM in **KB**
         used       :py:class:`int`     Total used RAM in **KB**
+        available  :py:class:`int`     Available RAM in **KB**
         free       :py:class:`int`     Free RAM in **KB**
         buffers    :py:class:`int`     Buffered RAM in **KB**
-        cached     :py:class:`int`     Cached RAM in **KB**
-        shared     :py:class:`int`     Shared RAM in **KB**, for NVIDIA Jetson the RAM used from GPU
+        cached     :py:class:`int`     Cached and reclaimable RAM in **KB**
+        shared     :py:class:`int`     Shared RAM in **KB**, for NVIDIA Jetson the RAM used from GPU (part of used)
         lfb        :py:class:`int`     Large Free Block in **4MB**
         ========== =================== ====================================================
 
@@ -685,17 +694,26 @@ class jtop(Thread):
         .. note::
 
             Note **A**
-                The RAM is measured reading the file :code:`/proc/meminfo` for each field is read:
+                The RAM is measured reading the file :code:`/proc/meminfo` for each field is read,
+                with :code:`R = max(MemAvailable, MemFree + Buffers)`:
 
                 ========== ====================================================
                 Name       Description
                 ========== ====================================================
                 tot        :code:`MemTotal`
-                used       :code:`MemTotal - (Buffers + Cached)`
+                used       :code:`MemTotal - R`
+                available  :code:`MemAvailable`
                 free       :code:`MemFree`
                 buffers    :code:`Buffers`
-                cached     :code:`Cached + SReclaimable`
+                cached     :code:`R - MemFree - Buffers`
                 ========== ====================================================
+
+                :code:`used + free + buffers + cached` is always :code:`tot`.
+                :code:`cached` covers page cache, reclaimable slab and driver page pools
+                (:code:`KReclaimable`). On kernels without :code:`MemAvailable`,
+                :code:`cached` is :code:`Cached + SReclaimable`, :code:`used` is
+                :code:`MemTotal - MemFree - Buffers - cached` and :code:`available` is
+                :code:`MemTotal - used`.
 
             Note **B**
                 The swap table is a list of dictionary with this data
@@ -1134,6 +1152,10 @@ class jtop(Thread):
             raise JtopException("Mismatch of Python versions between library and service")
         except AuthenticationError:
             raise JtopException("Authentication with jetson-stats server failed")
+        # Proxies share one connection for each server address and thread. After a restart of
+        # jtop.service, proxies of an older jtop object would make the new ones write to the
+        # closed connection with BrokenPipeError: open a new connection for this object.
+        BaseProxy._address_to_local.pop(self._broadcaster.address, None)
         # Initialize synchronized data and condition
         self._controller = self._broadcaster.get_queue()
         self._sync_data = self._broadcaster.sync_data()
